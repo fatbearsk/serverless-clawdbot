@@ -35,7 +35,7 @@
   "crons": [
     {
       "path": "/api/claw?op=cron",
-      "schedule": "*/5 * * * *"
+      "schedule": "0 0 * * *"
     }
   ]
 }
