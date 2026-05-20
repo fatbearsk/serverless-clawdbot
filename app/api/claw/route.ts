@@ -10,7 +10,6 @@ import OpenAI from "openai";
 
 import { sessionWorkflow } from "@/app/workflows/session";
 import { daemonWorkflow } from "@/app/workflows/daemon";
-import { startAutopilotIfNeeded } from "@/app/lib/autopilotRuntime";
 
 import type { Channel } from "@/app/lib/identity";
 import { makeIdentity } from "@/app/lib/identity";
@@ -35,7 +34,6 @@ import {
 import { isInboundAllowed } from "@/app/lib/allowlist";
 import { saveSessionMeta, getLastSession, getSessionMeta } from "@/app/lib/sessionMeta";
 import { ensurePairingCode, exchangePairingCode, verifyGatewayBearer } from "@/app/lib/gatewayAuth";
-import { enqueueInboundMessage, listPendingSessionIds, recoverStaleInboundMessages } from "@/app/lib/inboundQueue";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -52,36 +50,12 @@ async function handleCronTrigger() {
   const lockKey = "daemon:lock";
   const acquired = await store.set(lockKey, String(Date.now()), { exSeconds: 70, nx: true });
 
-  const daemon = {
-    started: false,
-    acquiredLock: acquired,
-  };
-
   if (acquired) {
     await start(daemonWorkflow, []);
-    daemon.started = true;
+    return jsonOk({ started: true, acquiredLock: true });
   }
 
-  const recoveredInbound = await recoverStaleInboundMessages();
-  const pendingSessions = await listPendingSessionIds(20);
-  const sessionStarts: Array<{ sessionId: string; started: boolean; error?: string }> = [];
-
-  for (const sessionId of pendingSessions) {
-    try {
-      await start(sessionWorkflow, [sessionId]);
-      sessionStarts.push({ sessionId, started: true });
-    } catch (error: any) {
-      sessionStarts.push({
-        sessionId,
-        started: false,
-        error: String(error?.message ?? error ?? "Unknown session start error"),
-      });
-    }
-  }
-
-  const autopilot = await startAutopilotIfNeeded("cron");
-
-  return jsonOk({ daemon, autopilot, inbound: { recoveredInbound, pendingSessions: sessionStarts } });
+  return jsonOk({ started: false, acquiredLock: false });
 }
 
 function isStopCmd(text: string) {
@@ -353,13 +327,10 @@ function buildTelegramInboundFromUpdate(
 
   const chat = message.chat;
   const from = message.from ?? chat;
-  const threadId =
-    typeof message?.message_thread_id === "number" ? message.message_thread_id : undefined;
-  const sessionId = threadId ? `telegram:${chat.id}:${threadId}` : `telegram:${chat.id}`;
 
   return {
     channel: "telegram",
-    sessionId,
+    sessionId: String(chat.id),
     senderId: String(from.id ?? chat.id),
     senderUsername: from.username ? String(from.username) : undefined,
     text,
@@ -538,10 +509,7 @@ async function maybeHandleChatPairingCommand(msg: InboundMessage): Promise<boole
 // Workflow routing
 // ============================================================
 async function routeToSession(msg: InboundMessage): Promise<void> {
-  const queued = await enqueueInboundMessage(msg);
-  if (!queued.accepted) return;
-
-  await start(sessionWorkflow, [msg.sessionId]);
+  await start(sessionWorkflow, [msg.sessionId, msg]);
 }
 
 // ============================================================
@@ -724,7 +692,7 @@ export async function GET(req: Request) {
     const body = await req.json().catch(() => null);
     if (!body) return new Response("Bad JSON", { status: 400 });
 
-    const message = String(body.message ?? body.text ?? "");
+    const message = String(body.message ?? "");
     if (!message) return new Response("Missing field: message", { status: 400 });
 
     const deliver = body.deliver !== undefined ? Boolean(body.deliver) : true;
@@ -803,7 +771,7 @@ export async function POST(req: Request) {
     const body = await req.json().catch(() => null);
     if (!body) return new Response("Bad JSON", { status: 400 });
 
-    const message = String(body.message ?? body.text ?? "");
+    const message = String(body.message ?? "");
     if (!message) return new Response("Missing field: message", { status: 400 });
 
     const deliver = body.deliver !== undefined ? Boolean(body.deliver) : true;
