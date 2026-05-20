@@ -15,14 +15,9 @@ import { VercelProvider } from "@composio/vercel";
 import { z } from "zod/v4";
 
 import { env } from "@/app/lib/env";
-import { getStore } from "@/app/lib/store";
-import { buildCoordinationContext, coordinatedToolExecute } from "@/app/lib/concurrency";
-import { buildDurableMemoryContext, listWorkItems, setMemoryFact, upsertWorkItem } from "@/app/lib/memory";
-import { shortHash } from "@/app/lib/hash";
 import type { Channel } from "@/app/lib/identity";
 import { createSendTask } from "@/app/lib/tasks";
 import { sshExec } from "@/app/steps/sshExec";
-import { createAgentTurnController } from "@/app/lib/agentTurnMachine";
 
 import {
   telegramSendMessage,
@@ -1123,7 +1118,7 @@ function renderTelegramStatus(args: {
   const active = args.tools.filter((tool) => tool.status === "running");
   const done = args.tools.filter((tool) => tool.status === "done").slice(-2);
 
-  const lines: string[] = [args.sawReasoning ? "Taking a closer look…" : "I’m on it."];
+  const lines: string[] = [args.sawReasoning ? "Thinking…" : "Working…"];
 
   if (args.stepNumber > 0) {
     lines.push(`Step ${args.stepNumber}`);
@@ -1144,7 +1139,7 @@ function renderTelegramStatus(args: {
     return lines.join("\n");
   }
 
-  lines.push("Wrapping this up.");
+  lines.push("Preparing response…");
   return lines.join("\n");
 }
 
@@ -3285,171 +3280,13 @@ function wrapComposioToolsWithAssetResolution(
   return wrapped as ToolSet;
 }
 
-type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high";
-
-type ReasoningPolicy = {
-  modelName: string;
-  modelTier: "fast" | "smart" | "reasoning";
-  reasoningEffort: ReasoningEffort;
-  maxToolSteps: number;
-  temperature: number;
-  streamFinalText: boolean;
-  progressMode: "silent_typing" | "natural_if_slow";
-  rationale: string;
-};
-
 function isReasoningModel(modelName: string): boolean {
   const name = String(modelName ?? "").trim().toLowerCase();
   return /^gpt-5(?:[.-]|$)/.test(name) || /^o[134](?:[.-]|$)/.test(name) || name.includes("reasoning");
 }
 
-function normalizeReasoningEffort(value: unknown, fallback: ReasoningEffort): ReasoningEffort {
-  const v = String(value ?? "").trim().toLowerCase();
-  if (["none", "minimal", "low", "medium", "high"].includes(v)) return v as ReasoningEffort;
-  return fallback;
-}
-
 function shouldSendTemperature(modelName: string, temperature: number): boolean {
   return Number.isFinite(temperature) && !isReasoningModel(modelName);
-}
-
-function tryParseJsonObjectLoose(text: string): any | null {
-  const raw = String(text ?? "").trim();
-  if (!raw) return null;
-  const candidates = [raw];
-  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fenced?.[1]) candidates.push(fenced[1].trim());
-  const first = raw.indexOf("{");
-  const last = raw.lastIndexOf("}");
-  if (first >= 0 && last > first) candidates.push(raw.slice(first, last + 1));
-  for (const candidate of candidates) {
-    try {
-      return JSON.parse(candidate);
-    } catch {
-      // continue
-    }
-  }
-  return null;
-}
-
-function fallbackReasoningPolicy(args: {
-  fastModel: string;
-  smartModel: string;
-  reasoningModel: string;
-  userText: string;
-  hasRichMedia: boolean;
-  historyChars: number;
-  toolCount: number;
-  baseTemperature: number;
-  baseMaxToolSteps: number;
-}): ReasoningPolicy {
-  const complexity =
-    Math.min(1, args.userText.length / 5000) * 0.35 +
-    Math.min(1, args.historyChars / 30000) * 0.2 +
-    Math.min(1, args.toolCount / 20) * 0.2 +
-    (args.hasRichMedia ? 0.25 : 0);
-
-  const useReasoning = complexity >= 0.42 && Boolean(args.reasoningModel);
-  const modelTier = useReasoning ? "reasoning" : args.hasRichMedia || complexity >= 0.25 ? "smart" : "fast";
-  const reasoningEffort: ReasoningEffort = useReasoning
-    ? complexity >= 0.75
-      ? "high"
-      : complexity >= 0.55
-        ? "medium"
-        : "low"
-    : "none";
-
-  const startingToolSteps = modelTier === "fast" ? Math.min(args.baseMaxToolSteps, 4) : args.baseMaxToolSteps;
-
-  return {
-    modelName: modelTier === "reasoning" ? args.reasoningModel : modelTier === "smart" ? args.smartModel : args.fastModel,
-    modelTier,
-    reasoningEffort,
-    maxToolSteps: Math.max(1, Math.min(40, Math.round(startingToolSteps + complexity * 8))),
-    temperature: modelTier === "fast" ? args.baseTemperature : Math.min(args.baseTemperature, 0.4),
-    streamFinalText: true,
-    progressMode: "silent_typing",
-    rationale: "local metric controller",
-  };
-}
-
-async function decideReasoningPolicy(args: {
-  fastModel: string;
-  smartModel: string;
-  reasoningModel: string;
-  userText: string;
-  hasRichMedia: boolean;
-  historyChars: number;
-  toolCount: number;
-  baseTemperature: number;
-  baseMaxToolSteps: number;
-}): Promise<ReasoningPolicy> {
-  const fallback = fallbackReasoningPolicy(args);
-
-  // Latency-first default: this controller is still dynamic, but it uses
-  // measurable runtime complexity locally instead of spending an extra model
-  // call before every response. Set AGENT_DYNAMIC_REASONING=model when you
-  // explicitly want the old model-router hop.
-  const routerMode = String(env("AGENT_DYNAMIC_REASONING") ?? env("AGENT_ROUTER_MODE") ?? "local")
-    .trim()
-    .toLowerCase();
-  const useModelRouter = routerMode === "model" || routerMode === "router";
-  if (!useModelRouter) return fallback;
-  if (!env("OPENAI_API_KEY")) return fallback;
-
-  const routerModel = env("ROUTER_MODEL_NAME") ?? env("FAST_MODEL_NAME") ?? env("MODEL_NAME") ?? args.fastModel;
-  const prompt = [
-    "You are a runtime controller for an agentic chat assistant.",
-    "Choose how much model reasoning and tool budget this next turn needs.",
-    "Do not classify with fixed keywords or intents. Evaluate the actual user message, ambiguity, external side-effect risk, context size, media, and whether a multi-step workflow is likely.",
-    "Return only JSON with keys: modelTier fast|smart|reasoning, reasoningEffort none|minimal|low|medium|high, maxToolSteps integer 1-40, temperature number 0-1, streamFinalText boolean, progressMode silent_typing|natural_if_slow, rationale string.",
-    "Use reasoning effort only when deeper hidden reasoning is worth latency/cost. Keep simple conversational turns fast.",
-    "",
-    `Text chars: ${args.userText.length}`,
-    `History chars: ${args.historyChars}`,
-    `Has rich media: ${args.hasRichMedia}`,
-    `Available tool count: ${args.toolCount}`,
-    `Reasoning model configured: ${args.reasoningModel ? "yes" : "no"}`,
-    args.reasoningModel ? "Reasoning tier may be used when the task warrants it." : "Do not choose reasoning tier because no reasoning model is configured.",
-    "Latest user message:",
-    truncateForModelContext(args.userText, 4000),
-  ].join("\n");
-
-  try {
-    const result = await generateText({
-      model: openai(routerModel),
-      prompt,
-      temperature: 0,
-    } as any);
-    const parsed = tryParseJsonObjectLoose(result.text);
-    if (!parsed) return fallback;
-
-    const parsedTier = ["fast", "smart", "reasoning"].includes(String(parsed.modelTier))
-      ? String(parsed.modelTier) as ReasoningPolicy["modelTier"]
-      : fallback.modelTier;
-    const tier = parsedTier === "reasoning" && !args.reasoningModel ? fallback.modelTier : parsedTier;
-    const effort = normalizeReasoningEffort(parsed.reasoningEffort, fallback.reasoningEffort);
-    const maxToolStepsRaw = Number(parsed.maxToolSteps);
-    const temperatureRaw = Number(parsed.temperature);
-    const modelName = tier === "reasoning" ? args.reasoningModel : tier === "smart" ? args.smartModel : args.fastModel;
-
-    return {
-      modelName,
-      modelTier: tier,
-      reasoningEffort: tier === "reasoning" ? effort === "none" ? "low" : effort : "none",
-      maxToolSteps: Number.isFinite(maxToolStepsRaw)
-        ? Math.max(1, Math.min(40, Math.floor(maxToolStepsRaw)))
-        : fallback.maxToolSteps,
-      temperature: Number.isFinite(temperatureRaw)
-        ? Math.max(0, Math.min(1, temperatureRaw))
-        : fallback.temperature,
-      streamFinalText: parsed.streamFinalText !== false,
-      progressMode: parsed.progressMode === "natural_if_slow" ? "natural_if_slow" : "silent_typing",
-      rationale: String(parsed.rationale ?? "dynamic controller").slice(0, 240),
-    };
-  } catch {
-    return fallback;
-  }
 }
 
 function buildModelCallArgs(args: {
@@ -3459,7 +3296,6 @@ function buildModelCallArgs(args: {
   tools: ToolSet;
   temperature: number;
   maxToolSteps: number;
-  reasoningEffort: ReasoningEffort;
 }) {
   const request: any = {
     model: openai(args.modelName),
@@ -3467,16 +3303,7 @@ function buildModelCallArgs(args: {
     messages: args.messages,
     tools: args.tools,
     stopWhen: stepCountIs(args.maxToolSteps),
-    providerOptions: {
-      openai: {
-        parallelToolCalls: false,
-      },
-    },
   };
-
-  if (isReasoningModel(args.modelName) && args.reasoningEffort !== "none") {
-    request.providerOptions.openai.reasoningEffort = args.reasoningEffort;
-  }
 
   if (shouldSendTemperature(args.modelName, args.temperature)) {
     request.temperature = args.temperature;
@@ -3504,12 +3331,6 @@ function isPromptBudgetRetryableError(error: unknown): boolean {
     text.includes("tokens per min") ||
     (text.includes("requested") && text.includes("tokens"))
   );
-}
-
-const EXTERNAL_TOOLS_REQUESTED_MARKER = "__EXTERNAL_TOOLS_REQUESTED__";
-
-function isExternalToolsRequestedError(error: unknown): boolean {
-  return stringifyError(error).includes(EXTERNAL_TOOLS_REQUESTED_MARKER);
 }
 
 function buildComposioSessionOptions(overrides?: ComposioSessionOverrides): ComposioSessionOverrides {
@@ -3688,160 +3509,6 @@ function createEditCoalescer(opts: {
   };
 }
 
-
-function extractStreamTextDelta(part: any): string {
-  if (!part || typeof part !== "object") return "";
-  for (const key of ["text", "delta", "textDelta", "text_delta"]) {
-    const value = part[key];
-    if (typeof value === "string" && value.length > 0) return value;
-  }
-  return "";
-}
-
-function safeJsonForRecovery(value: unknown): string {
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value ?? "");
-  }
-}
-
-function extractTextFromArbitraryContent(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (content == null) return "";
-
-  if (Array.isArray(content)) {
-    return content
-      .map((part) => {
-        if (typeof part === "string") return part;
-        if (!part || typeof part !== "object") return "";
-        const p: any = part;
-        if (typeof p.text === "string") return p.text;
-        if (typeof p.delta === "string") return p.delta;
-        if (typeof p.textDelta === "string") return p.textDelta;
-        if (p.type === "tool-result" || p.type === "tool-output-available") {
-          return safeJsonForRecovery(p.result ?? p.output ?? p.content ?? p);
-        }
-        if (p.type === "file" || p.type === "image") return "[" + p.type + "]";
-        return "";
-      })
-      .filter((x) => x.trim().length > 0)
-      .join("\n");
-  }
-
-  if (typeof content === "object") {
-    const c: any = content;
-    if (typeof c.text === "string") return c.text;
-    if (typeof c.content === "string") return c.content;
-  }
-
-  return "";
-}
-
-function extractAssistantTextFromResponseMessages(messages: unknown): string {
-  if (!Array.isArray(messages)) return "";
-
-  const chunks: string[] = [];
-  for (const message of messages) {
-    const m: any = message;
-    if (!m || m.role !== "assistant") continue;
-    const text = extractTextFromArbitraryContent(m.content).trim();
-    if (text) chunks.push(text);
-  }
-
-  return chunks.join("\n").trim();
-}
-
-function modelMessageForRecovery(message: unknown): string {
-  const m: any = message;
-  if (!m || typeof m !== "object") return String(message ?? "");
-  const role = String(m.role ?? "message");
-  const contentText = extractTextFromArbitraryContent(m.content).trim();
-  if (contentText) return role + ": " + contentText;
-  return role + ": " + safeJsonForRecovery(m).slice(0, 3000);
-}
-
-function responseMessageForRecovery(message: unknown): string {
-  const m: any = message;
-  if (!m || typeof m !== "object") return String(message ?? "");
-  const role = String(m.role ?? "response");
-  const contentText = extractTextFromArbitraryContent(m.content).trim();
-  if (contentText) return role + ": " + contentText;
-  return role + ": " + safeJsonForRecovery(m).slice(0, 3000);
-}
-
-async function readStreamResultText(result: any): Promise<string> {
-  const value = result?.text;
-  try {
-    if (typeof value === "string") return value;
-    if (value && typeof value.then === "function") return String(await value);
-  } catch {
-    // fall through
-  }
-  return "";
-}
-
-async function readStreamResponseMessages(result: any): Promise<any[]> {
-  try {
-    const value = result?.response;
-    const response = value && typeof value.then === "function" ? await value : value;
-    return Array.isArray(response?.messages) ? response.messages : [];
-  } catch {
-    return [];
-  }
-}
-
-async function recoverEmptyAssistantText(args: {
-  modelName: string;
-  system: string;
-  originalMessages: ModelMessage[];
-  responseMessages: any[];
-  temperature: number;
-  reasoningEffort: ReasoningEffort;
-}): Promise<string> {
-  const transcript = [
-    "Original conversation:",
-    ...args.originalMessages.map(modelMessageForRecovery),
-    "",
-    "Model/tool transcript from the previous attempt:",
-    ...(args.responseMessages.length ? args.responseMessages.map(responseMessageForRecovery) : ["(No response messages were returned.)"]),
-  ].join("\n");
-
-  const prompt = [
-    "The previous model/tool loop ended without assembled assistant text.",
-    "Do not call tools again. Use only the transcript below and provide the final user-facing answer now.",
-    "If the transcript does not contain enough information, say exactly what is missing and ask one concise follow-up question.",
-    "",
-    truncateForModelContext(transcript, 18000),
-  ].join("\n");
-
-  const request: any = {
-    model: openai(args.modelName),
-    system: args.system,
-    prompt,
-    providerOptions: {
-      openai: {
-        parallelToolCalls: false,
-      },
-    },
-  };
-
-  if (isReasoningModel(args.modelName) && args.reasoningEffort !== "none") {
-    request.providerOptions.openai.reasoningEffort = args.reasoningEffort;
-  }
-
-  if (shouldSendTemperature(args.modelName, args.temperature)) {
-    request.temperature = args.temperature;
-  }
-
-  try {
-    const result = await generateText(request);
-    return String(result.text ?? "").trim();
-  } catch {
-    return "";
-  }
-}
-
 // ============================================================
 // MAIN
 // ============================================================
@@ -3852,9 +3519,6 @@ export async function agentTurn(args: {
   history: ModelMessage[];
   showTyping?: boolean;
   composio?: AgentTurnComposioConfig;
-  turnId?: string;
-  durableMemory?: string;
-  deliveryIdempotencyKey?: string;
 }) {
   "use step";
 
@@ -3884,20 +3548,19 @@ export async function agentTurn(args: {
 
   const fastModel = env("FAST_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-4o-mini";
   const smartModel = env("SMART_MODEL_NAME") ?? env("MODEL_NAME") ?? "gpt-4o";
-  const reasoningModel = env("REASONING_MODEL_NAME") ?? env("THINKING_MODEL_NAME") ?? "";
-  const baseTemperature = Number(env("MODEL_TEMPERATURE") ?? "0.7");
-  const baseMaxToolSteps = Math.max(1, parseIntOr(env("AGENT_MAX_TOOL_STEPS"), 6));
-  const turnId = args.turnId ?? shortHash({ sessionId: args.sessionId, userId: args.userId, userText, at: Date.now() }, 32);
-  const turnLifecycle = createAgentTurnController();
+  const forceSmart = (env("AGENT_FORCE_SMART_MODEL") ?? "true") !== "false";
+  const modelName = forceSmart ? smartModel : hasRichMedia ? smartModel : fastModel;
+
+  const temperature = Number(env("MODEL_TEMPERATURE") ?? "0.7");
+  const maxToolSteps = Math.max(1, parseIntOr(env("AGENT_MAX_TOOL_STEPS"), 11));
 
   const isTelegram = args.channel === "telegram";
   const telegramStreamingEnabled =
     isTelegram && (args.showTyping ?? true) && (env("TELEGRAM_STREAMING") ?? "true") !== "false";
 
-  const editThrottleMs = Math.max(120, Math.min(1000, Number(env("TELEGRAM_EDIT_THROTTLE_MS") ?? 220)));
+  const editThrottleMs = 120;
   const typingIntervalMs = Math.max(1000, Number(env("TELEGRAM_TYPING_INTERVAL_MS") ?? 4000));
   const maxEditChars = Math.max(800, Math.min(3800, Number(env("TELEGRAM_STREAM_CHUNK_CHARS") ?? 3500)));
-  const streamOpenChars = Math.max(8, Math.min(300, Number(env("TELEGRAM_STREAM_FIRST_CHARS") ?? 24)));
 
   let typingLoop: { stop: () => void } | null = null;
   let placeholderMsgId: number | null = null;
@@ -4072,7 +3735,6 @@ export async function agentTurn(args: {
         sessionId: args.sessionId,
         text: input.text,
         createdBy: "agent",
-        idempotencyKey: shortHash({ turnId, kind: "schedule_message", dueAt: Math.floor(dueAt / 60_000) * 60_000, text: input.text }, 32),
       } as any);
       return { ok: true, taskId: id, dueAt };
     },
@@ -4739,78 +4401,6 @@ export async function agentTurn(args: {
     },
   });
 
-  const rememberUserFact = tool({
-    description:
-      "Persist a durable user/session memory fact that should survive future turns. Use only for stable preferences, decisions, names, constraints, or important project state.",
-    inputSchema: zodSchema(
-      z.object({
-        key: z.string().min(1).max(80),
-        value: z.string().min(1).max(2000),
-      })
-    ),
-    execute: async (input: { key: string; value: string }) => {
-      await setMemoryFact(args.userId, input.key, input.value, { source: `turn:${turnId}` });
-      return { ok: true, key: input.key, value: input.value };
-    },
-  });
-
-  const recallUserMemory = tool({
-    description:
-      "Recall durable memory context for this user/session, including summary, facts, active work items, and recent events.",
-    inputSchema: zodSchema(z.object({})),
-    execute: async () => {
-      const context = await buildDurableMemoryContext(args.userId, args.sessionId);
-      return { ok: true, context };
-    },
-  });
-
-  const upsertDurableWorkItem = tool({
-    description:
-      "Create or update a durable work item for a multi-step or long-running task. Use this to checkpoint progress before tool-heavy work, blocking issues, or follow-up tasks.",
-    inputSchema: zodSchema(
-      z.object({
-        id: z.string().max(80).optional(),
-        title: z.string().min(1).max(300),
-        status: z.enum(["open", "in_progress", "blocked", "done", "cancelled"]).optional(),
-        notes: z.string().max(2000).optional(),
-        resourceKey: z.string().max(200).optional(),
-      })
-    ),
-    execute: async (input: {
-      id?: string;
-      title: string;
-      status?: "open" | "in_progress" | "blocked" | "done" | "cancelled";
-      notes?: string;
-      resourceKey?: string;
-    }) => {
-      const item = await upsertWorkItem({
-        userId: args.userId,
-        sessionId: args.sessionId,
-        id: input.id,
-        title: input.title,
-        status: input.status,
-        notes: input.notes,
-        resourceKey: input.resourceKey,
-        turnId,
-      });
-      return { ok: true, item };
-    },
-  });
-
-  const listDurableWorkItems = tool({
-    description: "List active durable work items for this user so parallel or resumed turns can avoid duplicate/contradictory work.",
-    inputSchema: zodSchema(
-      z.object({
-        includeDone: z.boolean().optional(),
-        limit: z.number().int().min(1).max(50).optional(),
-      })
-    ),
-    execute: async (input: { includeDone?: boolean; limit?: number }) => {
-      const items = await listWorkItems(args.userId, { includeDone: input.includeDone, limit: input.limit });
-      return { ok: true, items };
-    },
-  });
-
   const composioGetMcpServer = tool({
     description:
       "Get the Composio MCP server URL and headers for this user session. Use when an MCP-compatible client needs connection details.",
@@ -5028,32 +4618,18 @@ export async function agentTurn(args: {
   }
 
   // ============================================================
-  // Tool setup: fast by default, full external tools on demand
+  // Load Composio session meta tools and wrap them with deterministic asset resolution
   // ============================================================
-  const hasComposioConfig = Boolean(getComposioProjectApiKey(args.composio));
-
-type RequestExternalToolsInput = {
-  reason?: string;
-};
-
-type RequestExternalToolsOutput = {
-  requested: true;
-  reason: string;
-  marker: string;
-};
-
-const requestExternalTools = tool<RequestExternalToolsInput, RequestExternalToolsOutput>({
-  description:
-    "Call this immediately when the user request requires any capability/tool that is not currently available in this fast path, including file/VFS work, sending media, scheduling, voice/TTS, SSH, external apps/services, browser automation, account auth, or Composio discovery/execution.",
-  inputSchema: zodSchema(
-    z.object({
-      reason: z.string().max(500).optional(),
-    })
-  ),
-  execute: async (input: RequestExternalToolsInput): Promise<RequestExternalToolsOutput> => {
-    throw new Error(`${EXTERNAL_TOOLS_REQUESTED_MARKER}: ${String(input.reason ?? "external tools needed")}`);
-  },
-});
+  let composioTools: ToolSet = {};
+  if (getComposioProjectApiKey(args.composio)) {
+    const rawTools = await getComposioToolsForUser(args.userId, args.composio?.session, args.composio).catch(
+      () => ({} as ToolSet)
+    );
+    composioTools = wrapComposioToolsWithAssetResolution(rawTools, {
+      sessionAssets,
+      composioConfig: args.composio,
+    });
+  }
 
   const nativeTools: ToolSet = {
     schedule_message: scheduleMessage,
@@ -5062,10 +4638,6 @@ const requestExternalTools = tool<RequestExternalToolsInput, RequestExternalTool
     composio_api_request: composioProjectApiRequest,
     composio_org_api_request: composioOrgApiRequest,
     composio_verify_webhook_signature: composioVerifyWebhookSignature,
-    remember_user_fact: rememberUserFact,
-    recall_user_memory: recallUserMemory,
-    upsert_durable_work_item: upsertDurableWorkItem,
-    list_durable_work_items: listDurableWorkItems,
     list_skills: listSkills,
     read_skill: readSkill,
     read_virtual_file: readVirtualFile,
@@ -5080,318 +4652,200 @@ const requestExternalTools = tool<RequestExternalToolsInput, RequestExternalTool
     send_voice_message_to_telegram: sendVoiceMessageToTelegram,
   };
 
-  function isReadOnlyToolForCoordination(toolName: string): boolean {
-    return new Set([
-      "request_external_tools",
-      "list_skills",
-      "read_skill",
-      "read_virtual_file",
-      "list_session_assets",
-      "inspect_session_asset",
-      "prepare_session_asset",
-      "recall_user_memory",
-      "list_durable_work_items",
-      "composio_get_mcp_server",
-      "composio_verify_webhook_signature",
-    ]).has(toolName);
-  }
+  const tools: ToolSet = {
+    ...composioTools,
+    ...nativeTools,
+  };
 
-  function wrapToolsWithCoordination(source: ToolSet): ToolSet {
-    const wrapped: Record<string, any> = {};
-
-    for (const [toolName, toolDef] of Object.entries(source as Record<string, any>)) {
-      if (!toolDef || typeof toolDef !== "object" || typeof toolDef.execute !== "function") {
-        wrapped[toolName] = toolDef;
-        continue;
-      }
-
-      if (isReadOnlyToolForCoordination(toolName)) {
-        wrapped[toolName] = toolDef;
-        continue;
-      }
-
-      wrapped[toolName] = {
-        ...toolDef,
-        execute: async (input: any, ...rest: any[]) => {
-          return await coordinatedToolExecute({
-            turnId,
-            sessionId: args.sessionId,
-            userId: args.userId,
-            toolName,
-            input,
-            execute: async () => await toolDef.execute(input, ...rest),
-          });
-        },
-      };
-    }
-
-    return wrapped as ToolSet;
-  }
-
-  const historyChars = primaryMessages.reduce((sum, message) => sum + approximateModelMessageChars(message), 0);
-  const estimatedToolCount = 1;
-  const policy = await decideReasoningPolicy({
-    fastModel,
-    smartModel,
-    reasoningModel,
-    userText,
-    hasRichMedia,
-    historyChars,
-    toolCount: estimatedToolCount,
-    baseTemperature,
-    baseMaxToolSteps,
-  });
-  const modelName = policy.modelName;
-  const temperature = policy.temperature;
-  const maxToolSteps = policy.maxToolSteps;
-
-  const baseTools: ToolSet = wrapToolsWithCoordination({
-    request_external_tools: requestExternalTools,
-  });
-
-  let fullToolsPromise: Promise<ToolSet> | null = null;
-  async function loadFullTools(): Promise<ToolSet> {
-    if (!fullToolsPromise) {
-      fullToolsPromise = (async () => {
-        let composioTools: ToolSet = {};
-        if (hasComposioConfig) {
-          const rawTools = await getComposioToolsForUser(args.userId, args.composio?.session, args.composio).catch(
-            () => ({} as ToolSet)
-          );
-          composioTools = wrapComposioToolsWithAssetResolution(rawTools, {
-            sessionAssets,
-            composioConfig: args.composio,
-          });
-        }
-
-        return wrapToolsWithCoordination({
-          ...composioTools,
-          ...nativeTools,
-        });
-      })();
-    }
-    return await fullToolsPromise;
-  }
-
-  const fastPathToolsEnabled = (env("AGENT_FAST_PATH_TOOLS") ?? "true") !== "false";
-  const eagerTools =
-    !fastPathToolsEnabled ||
-    (env("AGENT_EAGER_TOOLS") ?? "false") === "true" ||
-    (hasComposioConfig &&
-      ((env("COMPOSIO_EAGER_TOOLS") ?? "false") === "true" ||
-        ((env("COMPOSIO_EAGER_ON_REASONING") ?? "false") === "true" && policy.modelTier === "reasoning")));
-  const tools: ToolSet = eagerTools ? await loadFullTools() : baseTools;
+  const retryTools: ToolSet = tools;
 
   // ============================================================
   // Telegram streaming helpers
   // ============================================================
-  let deliveryDedupeClaimed: boolean | null = null;
-
-  async function claimDeliveryDedupe(): Promise<boolean> {
-    if (!args.deliveryIdempotencyKey) return true;
-    if (deliveryDedupeClaimed != null) return deliveryDedupeClaimed;
-
-    const store = getStore();
-    const key = `outbound:dedupe:${args.deliveryIdempotencyKey}`;
-    deliveryDedupeClaimed = await store.set(
-      key,
-      {
-        status: "pending",
-        channel: args.channel,
-        sessionId: args.sessionId,
-        turnId,
-        startedAt: Date.now(),
-      } as any,
-      {
-        nx: true,
-        exSeconds: Math.max(3600, Number(env("OUTBOUND_DEDUPE_TTL_SECONDS") ?? 60 * 60 * 24 * 14)),
-      }
-    );
-    return deliveryDedupeClaimed;
-  }
-
-  async function markDeliveryDedupeSent(extra?: Record<string, unknown>) {
-    if (!args.deliveryIdempotencyKey || !deliveryDedupeClaimed) return;
-    const store = getStore();
-    await store.set(
-      `outbound:dedupe:${args.deliveryIdempotencyKey}`,
-      {
-        status: "sent",
-        channel: args.channel,
-        sessionId: args.sessionId,
-        turnId,
-        finishedAt: Date.now(),
-        ...(extra ?? {}),
-      } as any,
-      {
-        exSeconds: Math.max(3600, Number(env("OUTBOUND_DEDUPE_TTL_SECONDS") ?? 60 * 60 * 24 * 14)),
-      }
-    );
-  }
-
-  async function clearDeliveryDedupeOnFailure() {
-    if (!args.deliveryIdempotencyKey || !deliveryDedupeClaimed) return;
-    await getStore().del(`outbound:dedupe:${args.deliveryIdempotencyKey}`);
-    deliveryDedupeClaimed = null;
-  }
-
   async function deliverFinalTelegram(text: string) {
-    try {
-      const chunks = splitForTelegram(text, maxEditChars);
+    const chunks = splitForTelegram(text, maxEditChars);
 
-      if (placeholderMsgId != null) {
-        try {
-          await telegramEditMessageText(args.sessionId, placeholderMsgId, chunks[0]);
-        } catch {
-          placeholderMsgId = await telegramSendMessage(args.sessionId, chunks[0]);
-        }
-      } else {
-        const canSend = await claimDeliveryDedupe();
-        if (!canSend) return { delivered: true, skipped: "duplicate_delivery" };
+    if (placeholderMsgId != null) {
+      try {
+        await telegramEditMessageText(args.sessionId, placeholderMsgId, chunks[0]);
+      } catch {
         placeholderMsgId = await telegramSendMessage(args.sessionId, chunks[0]);
       }
-
-      for (let i = 1; i < chunks.length; i++) {
-        await telegramSendMessage(args.sessionId, chunks[i], { disableNotification: true });
-      }
-
-      await markDeliveryDedupeSent({ telegramMessageId: placeholderMsgId });
-      return { delivered: true };
-    } catch (error) {
-      await clearDeliveryDedupeOnFailure();
-      throw error;
+    } else {
+      placeholderMsgId = await telegramSendMessage(args.sessionId, chunks[0]);
     }
+
+    for (let i = 1; i < chunks.length; i++) {
+      await telegramSendMessage(args.sessionId, chunks[i], { disableNotification: true });
+    }
+
+    return { delivered: true };
   }
 
   async function streamToTelegram(fullStream: AsyncIterable<any>): Promise<string> {
     let full = "";
-    type EditCoalescer = ReturnType<typeof createEditCoalescer>;
-    let editor: EditCoalescer | null = null;
+    let stepNumber = 0;
+    let sawReasoning = false;
 
-    const shouldOpenLiveMessage = (text: string, force = false) => {
-      if (force) return text.trim().length > 0;
-      if (!policy.streamFinalText) return false;
-      const t = text.trim();
-      return t.length >= streamOpenChars || /[.!?]\s*$/.test(t) || t.includes("\n");
-    };
+    const toolStates = new Map<string, TelegramLiveToolState>();
 
-    const requestRender = async (force = false) => {
-      if (!full.trim()) return;
-      if (!editor) {
-        if (!shouldOpenLiveMessage(full, force)) return;
-        const canSend = await claimDeliveryDedupe();
-        if (!canSend) return;
-        try {
-          placeholderMsgId = await telegramSendMessage(
-            args.sessionId,
-            truncateForTelegramLive(full, maxEditChars)
-          );
-        } catch (error) {
-          await clearDeliveryDedupeOnFailure();
-          throw error;
-        }
-        editor = createEditCoalescer({
-          sessionId: args.sessionId,
-          messageId: placeholderMsgId,
-          throttleMs: editThrottleMs,
-        });
+    const editor = createEditCoalescer({
+      sessionId: args.sessionId,
+      messageId: placeholderMsgId!,
+      throttleMs: editThrottleMs,
+    });
+
+    const requestRender = () => {
+      if (full.length > 0) {
+        editor.requestTypewriter(truncateForTelegramLive(full, maxEditChars));
         return;
       }
 
-      editor.requestTypewriter(truncateForTelegramLive(full, maxEditChars));
+      editor.requestStatus(
+        truncateForTelegramLive(
+          renderTelegramStatus({
+            stepNumber,
+            sawReasoning,
+            tools: Array.from(toolStates.values()),
+          }),
+          maxEditChars
+        )
+      );
     };
+
+    const upsertToolState = (part: any, patch: Partial<TelegramLiveToolState>) => {
+      const toolCallId = String(part?.toolCallId ?? part?.id ?? "");
+      const prev = toolStates.get(toolCallId) ?? {
+        toolCallId,
+        toolName: String(part?.toolName ?? "tool"),
+        status: "running" as const,
+      };
+
+      toolStates.set(toolCallId, {
+        ...prev,
+        ...patch,
+        toolCallId,
+        toolName: String(part?.toolName ?? patch.toolName ?? prev.toolName ?? "tool"),
+      });
+    };
+
+    requestRender();
 
     for await (const part of fullStream) {
       const type = String(part?.type ?? "");
 
       switch (type) {
-        case "text":
-        case "text-delta": {
-          const delta = extractStreamTextDelta(part);
-          if (delta) {
-            full += delta;
-            turnLifecycle.send({ type: "TEXT_SEEN" });
-          }
-          await requestRender(false);
+        case "start-step": {
+          stepNumber += 1;
+          requestRender();
           break;
         }
 
-        case "tool-call":
-        case "tool-call-streaming-start":
+        case "reasoning":
+        case "reasoning-start":
+        case "reasoning-delta": {
+          sawReasoning = true;
+          requestRender();
+          break;
+        }
+
+        case "tool-input-start":
+        case "tool-call-streaming-start": {
+          upsertToolState(part, {
+            status: "running",
+          });
+          requestRender();
+          break;
+        }
+
+        case "tool-input-delta":
         case "tool-call-delta": {
-          const toolName = String(part?.toolName ?? part?.tool_name ?? "");
-          if (toolName === "request_external_tools") {
-            throw new Error(`${EXTERNAL_TOOLS_REQUESTED_MARKER}: streamed tool request`);
-          }
+          const previousId = String(part?.toolCallId ?? part?.id ?? "");
+          const previous = toolStates.get(previousId);
+          const delta = String(part?.delta ?? part?.argsTextDelta ?? "");
+          const nextArgs = `${previous?.argsPreview ?? ""}${delta}`;
+
+          upsertToolState(part, {
+            status: "running",
+            argsPreview: singleLineStatus(nextArgs, 220),
+          });
+          requestRender();
+          break;
+        }
+
+        case "tool-input-end": {
+          requestRender();
+          break;
+        }
+
+        case "tool-call": {
+          upsertToolState(part, {
+            status: "running",
+            argsPreview: summarizeToolPayloadForTelegram(part?.input ?? part?.args, 220),
+          });
+          requestRender();
           break;
         }
 
         case "tool-result": {
-          const toolName = String(part?.toolName ?? part?.tool_name ?? "");
-          if (toolName === "request_external_tools") {
-            throw new Error(`${EXTERNAL_TOOLS_REQUESTED_MARKER}: streamed tool result`);
-          }
+          upsertToolState(part, {
+            status: "done",
+            resultPreview: summarizeToolPayloadForTelegram(part?.output ?? part?.result, 180),
+          });
+          requestRender();
           break;
         }
 
-        case "error": {
-          throw new Error("AI stream error: " + stringifyError(part?.error ?? part));
+        case "text": {
+          full += String(part?.text ?? "");
+          requestRender();
+          break;
         }
 
+        case "text-delta": {
+          full += String(part?.delta ?? part?.textDelta ?? "");
+          requestRender();
+          break;
+        }
+
+        case "text-start":
+        case "text-end":
+        case "finish-step":
         case "finish":
-        case "text-end": {
-          await requestRender(true);
+        case "error": {
+          requestRender();
           break;
         }
 
         default:
-          // No generic tool/reasoning status text. Telegram's typing indicator is the human-feeling progress signal.
           break;
       }
     }
 
-    await requestRender(true);
-    const finalEditor = editor as EditCoalescer | null;
-    await finalEditor?.flush();
+    await editor.flush();
     return full;
   }
 
   // ============================================================
   // System prompt
   // ============================================================
-  const memoryContext = String(args.durableMemory ?? "").trim();
-  const coordinationContext = buildCoordinationContext({ sessionId: args.sessionId, turnId });
-
   const system = [
     "You are an Agentic Operating System assistant running in Telegram/WhatsApp/SMS with Composio tools.",
-    "You should feel like a capable human operator: no canned status phrases and no fake progress. Either quietly use typing indicators or give a natural, specific update only when useful.",
-    "",
-    "RUNTIME POLICY:",
-    `- Controller selected model tier: ${policy.modelTier}; reasoning effort: ${policy.reasoningEffort}; max tool steps: ${policy.maxToolSteps}.`,
-    `- Controller rationale: ${policy.rationale}.`,
-    "- The controller, not keyword rules, decided the thinking/tool budget for this turn. Follow through with enough care for the selected budget.",
-    "",
-    "DURABLE MEMORY:",
-    memoryContext || "- No durable memory has been recorded yet.",
-    "- Use remember_user_fact for stable user preferences, project constraints, important names, and decisions that should survive future turns.",
-    "- Use upsert_durable_work_item to checkpoint long-running or multi-step tasks before and after meaningful progress.",
-    "",
-    "CONCURRENCY AND FAULT TOLERANCE:",
-    coordinationContext,
-    "- If a tool reports that another turn is using the same resource, do not duplicate or contradict that action. Explain briefly or continue with safe non-conflicting work.",
-    "- For external side effects, trust tool results over assumptions. Never say something was changed/sent/created unless the tool result confirms it.",
     "",
     "CRITICAL TOOL RULES:",
-    "- If the user asks for an action or a capability requiring a tool, use the appropriate tool; if the tool is not currently available and request_external_tools is available, call request_external_tools first.",
+    "- If the user asks for an external action, use the appropriate tool.",
     "- Never claim an action succeeded unless a tool call returned success.",
     "- For external apps/services, prefer the Composio session meta tools already loaded for this user.",
     "- Let Composio search, authenticate, and execute dynamically at runtime instead of relying on hard-coded toolkit routing.",
     "",
     "COMPOSIO SESSION:",
     `- Active namespace: ${args.userId}`,
-    "- For latency, full Composio session tools may be loaded lazily instead of before every simple chat reply.",
-    "- If request_external_tools is available and the user needs any missing tool/action/file/send/schedule/voice/external app/browser/account capability, call it immediately before answering; the runtime will retry this turn with the full tool set loaded.",
-    "- When full Composio tools are available, use COMPOSIO_SEARCH_TOOLS for dynamic discovery, COMPOSIO_GET_TOOL_SCHEMAS for exact inputs, COMPOSIO_MANAGE_CONNECTIONS for auth, COMPOSIO_MULTI_EXECUTE_TOOL/COMPOSIO_EXECUTE_TOOL for actions, and COMPOSIO_REMOTE_WORKBENCH/COMPOSIO_REMOTE_BASH_TOOL for sandbox work.",
+    "- session.tools() returns Composio meta tools for discovery, auth, execution, browser automation toolkit discovery, and the persistent workbench sandbox.",
+    "- Use COMPOSIO_SEARCH_TOOLS when you do not know the exact app/tool slug or need browser automation or other dynamic toolkit discovery.",
+    "- Use COMPOSIO_GET_TOOL_SCHEMAS to inspect exact tool inputs before execution.",
+    "- Use COMPOSIO_MANAGE_CONNECTIONS when auth may be missing or the user asks to connect an app.",
+    "- Use COMPOSIO_MULTI_EXECUTE_TOOL or COMPOSIO_EXECUTE_TOOL to run Composio actions after discovery.",
+    "- Use COMPOSIO_REMOTE_WORKBENCH or COMPOSIO_REMOTE_BASH_TOOL for the Composio code sandbox/workbench.",
     "- Use composio_api_request for project-scoped Composio platform APIs that are outside session meta tools, including /webhook_subscriptions, /trigger_instances, /triggers_types, /connected_accounts, /auth_configs, /toolkits, /tools, /files, /mcp, /tool_router, and /org/project/config.",
     "- Use composio_org_api_request only for org-level project administration endpoints such as /org/owner/project/list or /org/owner/project/new when an org key is configured.",
     "- Use composio_get_mcp_server to retrieve MCP connection info for this user session.",
@@ -5426,107 +4880,10 @@ const requestExternalTools = tool<RequestExternalToolsInput, RequestExternalTool
     "- Use send_voice_message_to_telegram when the user asks for a spoken reply, voice note, or text-to-speech response from the bot itself.",
     "",
     `Mode: ${autonomy}`,
-    "Be concise, accurate, and tool-grounded. For long tasks, preserve continuity with durable work items and memory rather than trying to hold everything only in transient chat history.",
+    "Be concise, accurate, and tool-grounded.",
   ].join("\n");
 
-  function operationalFallbackText(error: unknown, reason: string): string {
-    const lower = stringifyError(error).toLowerCase();
-
-    if (lower.includes("openai_api_key") || lower.includes("api key")) {
-      return "I can see your message, but this deployment is missing the model API key/config it needs to answer. Once that’s set, I’ll respond normally.";
-    }
-
-    if (lower.includes("rate_limit") || lower.includes("rate limit") || lower.includes("tokens per min")) {
-      return "I got rate-limited while answering that. Please try once more in a moment.";
-    }
-
-    if (lower.includes("context_length") || lower.includes("maximum context") || lower.includes("too many tokens")) {
-      return "That came through, but the conversation/context is too large for the model to finish cleanly. Send the most important part again and I’ll handle it from there.";
-    }
-
-    if (reason === "empty_model_output") {
-      return "I got your message, but the response came back empty. Send “retry” or restate it and I’ll run it again.";
-    }
-
-    return "I got your message, but hit a temporary generation issue before I could send the answer. Please try again.";
-  }
-
-  function lifecyclePayload<T extends Record<string, any>>(payload: T): T & {
-    lifecycle: ReturnType<typeof turnLifecycle.snapshot>;
-    lifecycleTrace: ReturnType<typeof turnLifecycle.trace>;
-  } {
-    return {
-      ...payload,
-      lifecycle: turnLifecycle.snapshot(),
-      lifecycleTrace: turnLifecycle.trace(),
-    };
-  }
-
-  async function deliverTelegramText(text: string) {
-    try {
-      const result = await deliverFinalTelegram(text);
-      turnLifecycle.send({ type: "DELIVERED" });
-      return result;
-    } catch (error) {
-      turnLifecycle.send({ type: "DELIVERY_ERROR" });
-      throw error;
-    }
-  }
-
-  async function recoverEmptyText(args: {
-    attemptMessages: ModelMessage[];
-    responseMessages: any[];
-    sourceError?: unknown;
-  }): Promise<{ text: string; recovered: boolean }> {
-    turnLifecycle.send({ type: "NO_ASSISTANT_TEXT" });
-
-    const recovered = await recoverEmptyAssistantText({
-      modelName,
-      system,
-      originalMessages: args.attemptMessages,
-      responseMessages: args.responseMessages,
-      temperature,
-      reasoningEffort: policy.reasoningEffort,
-    });
-
-    if (recovered.trim()) {
-      turnLifecycle.send({ type: "FALLBACK_TEXT" });
-      return { text: recovered.trim(), recovered: true };
-    }
-
-    turnLifecycle.send({ type: "FALLBACK_TEXT" });
-    return {
-      text: operationalFallbackText(args.sourceError, "empty_model_output"),
-      recovered: true,
-    };
-  }
-
-  async function resultFromModelFailure(error: unknown, deliverTelegram: boolean) {
-    turnLifecycle.send({ type: "MODEL_ERROR" });
-    const text = operationalFallbackText(error, "model_error");
-    turnLifecycle.send({ type: "FALLBACK_TEXT" });
-
-    if (deliverTelegram) {
-      await deliverTelegramText(text);
-    }
-
-    return lifecyclePayload({
-      text,
-      responseMessages: [] as any[],
-      delivered: deliverTelegram,
-      recovered: true,
-      recoveryReason: "model_error",
-      error: stringifyError(error),
-    });
-  }
-
-  async function runStreamingAttempt(
-    attemptMessages: ModelMessage[],
-    attemptTools: ToolSet,
-    lifecycleEvent: "START_STREAMING" | "RETRY_STREAMING" = "START_STREAMING"
-  ) {
-    turnLifecycle.send({ type: lifecycleEvent });
-
+  async function runStreamingAttempt(attemptMessages: ModelMessage[], attemptTools: ToolSet) {
     const s = streamText(
       buildModelCallArgs({
         modelName,
@@ -5535,170 +4892,70 @@ const requestExternalTools = tool<RequestExternalToolsInput, RequestExternalTool
         tools: attemptTools,
         temperature,
         maxToolSteps,
-        reasoningEffort: policy.reasoningEffort,
       })
     );
 
-    let streamedText = "";
-    try {
-      streamedText = await streamToTelegram(s.fullStream as AsyncIterable<any>);
-    } catch (error) {
-      turnLifecycle.send({ type: "STREAM_ERROR" });
-      throw error;
-    }
+    const streamedText = await streamToTelegram(s.fullStream as AsyncIterable<any>);
 
-    const promiseText = await readStreamResultText(s);
-    const responseMessages = await readStreamResponseMessages(s);
-    const responseText = extractAssistantTextFromResponseMessages(responseMessages);
+    const maybeText = (s as any).text;
+    const fallbackText =
+      typeof maybeText === "string"
+        ? maybeText
+        : maybeText && typeof maybeText.then === "function"
+          ? await maybeText
+          : "";
 
-    let text = String(streamedText || promiseText || responseText || "").trim();
-    let recovered = false;
+    const text = String(streamedText || fallbackText || "").trim();
 
     if (!text) {
-      const recovery = await recoverEmptyText({
-        attemptMessages,
-        responseMessages,
-      });
-      text = recovery.text;
-      recovered = recovery.recovered;
-    } else {
-      turnLifecycle.send({ type: "GENERATED_TEXT" });
+      throw new Error("Streaming completed without assistant text");
     }
 
-    await deliverTelegramText(text);
+    await deliverFinalTelegram(text);
 
-    return lifecyclePayload({
-      text,
-      responseMessages,
-      delivered: true,
-      recovered,
-    });
+    const responseMessages = Array.isArray((await (s as any).response)?.messages)
+      ? ((await (s as any).response).messages as any[])
+      : [];
+
+    return { text, responseMessages, delivered: true };
   }
 
-  async function runGenerateAttempt(
-    attemptMessages: ModelMessage[],
-    attemptTools: ToolSet,
-    options: {
-      deliverTelegram?: boolean;
-      lifecycleEvent?: "START_GENERATE" | "RETRY_GENERATE";
-      sourceError?: unknown;
-    } = {}
-  ) {
-    turnLifecycle.send({ type: options.lifecycleEvent ?? "START_GENERATE" });
 
-    try {
-      const r = await generateText(
-        buildModelCallArgs({
-          modelName,
-          system,
-          messages: attemptMessages,
-          tools: attemptTools,
-          temperature,
-          maxToolSteps,
-          reasoningEffort: policy.reasoningEffort,
-        })
-      );
+  async function runGenerateAttempt(attemptMessages: ModelMessage[], attemptTools: ToolSet) {
+    const r = await generateText(
+      buildModelCallArgs({
+        modelName,
+        system,
+        messages: attemptMessages,
+        tools: attemptTools,
+        temperature,
+        maxToolSteps,
+      })
+    );
 
-      const responseMessages = (r.response?.messages as any[]) ?? [];
-      let text = String(r.text || extractAssistantTextFromResponseMessages(responseMessages) || "").trim();
-      let recovered = false;
-
-      if (!text) {
-        const recovery = await recoverEmptyText({
-          attemptMessages,
-          responseMessages,
-          sourceError: options.sourceError,
-        });
-        text = recovery.text;
-        recovered = recovery.recovered;
-      } else {
-        turnLifecycle.send({ type: "GENERATED_TEXT" });
-      }
-
-      if (options.deliverTelegram) {
-        await deliverTelegramText(text);
-      }
-
-      return lifecyclePayload({
-        text,
-        responseMessages,
-        delivered: Boolean(options.deliverTelegram),
-        recovered,
-      });
-    } catch (error) {
-      if (isExternalToolsRequestedError(error)) {
-        turnLifecycle.send({ type: "MODEL_ERROR" });
-        throw error;
-      }
-      if (isPromptBudgetRetryableError(error) && !options.sourceError) {
-        turnLifecycle.send({ type: "MODEL_ERROR" });
-        throw error;
-      }
-      return await resultFromModelFailure(error, Boolean(options.deliverTelegram));
-    }
+    return { text: r.text, responseMessages: (r.response?.messages as any[]) ?? [] };
   }
 
   try {
     if (telegramStreamingEnabled) {
       typingLoop = telegramStartChatActionLoop(args.sessionId, "typing", { intervalMs: typingIntervalMs });
+      placeholderMsgId = await telegramSendMessage(args.sessionId, "Thinking…", { disableNotification: true });
 
       try {
         return await runStreamingAttempt(primaryMessages, tools);
       } catch (error) {
-        if (isExternalToolsRequestedError(error)) {
-          const fullTools = await loadFullTools();
-          try {
-            return await runStreamingAttempt(primaryMessages, fullTools, "RETRY_STREAMING");
-          } catch (externalRetryError) {
-            return await runGenerateAttempt(retryMessages, fullTools, {
-              deliverTelegram: true,
-              lifecycleEvent: "RETRY_GENERATE",
-              sourceError: externalRetryError,
-            });
-          }
-        }
-
-        if (isPromptBudgetRetryableError(error)) {
-          try {
-            return await runStreamingAttempt(retryMessages, tools, "RETRY_STREAMING");
-          } catch (retryError) {
-            return await runGenerateAttempt(retryMessages, tools, {
-              deliverTelegram: true,
-              lifecycleEvent: "RETRY_GENERATE",
-              sourceError: retryError,
-            });
-          }
-        }
-
-        return await runGenerateAttempt(retryMessages, tools, {
-          deliverTelegram: true,
-          lifecycleEvent: "RETRY_GENERATE",
-          sourceError: error,
-        });
+        if (!isPromptBudgetRetryableError(error)) throw error;
+        return await runStreamingAttempt(retryMessages, retryTools);
       }
     }
 
     try {
       return await runGenerateAttempt(primaryMessages, tools);
     } catch (error) {
-      if (isExternalToolsRequestedError(error)) {
-        const fullTools = await loadFullTools();
-        return await runGenerateAttempt(primaryMessages, fullTools, {
-          lifecycleEvent: "RETRY_GENERATE",
-          sourceError: error,
-        });
-      }
-
-      if (!isPromptBudgetRetryableError(error)) {
-        return await resultFromModelFailure(error, false);
-      }
-      return await runGenerateAttempt(retryMessages, tools, {
-        lifecycleEvent: "RETRY_GENERATE",
-        sourceError: error,
-      });
+      if (!isPromptBudgetRetryableError(error)) throw error;
+      return await runGenerateAttempt(retryMessages, retryTools);
     }
   } finally {
     typingLoop?.stop();
-    turnLifecycle.stop();
   }
 }
