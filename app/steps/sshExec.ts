@@ -44,7 +44,7 @@ export async function sshExec(command: string): Promise<string> {
 
     conn
       .on("ready", () => {
-        conn.exec(command, (err: Error | undefined, stream: any) => {
+        conn.exec(command, (err, stream) => {
           if (err) {
             conn.end();
             reject(err);
