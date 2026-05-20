@@ -1,27 +1,32 @@
 // app/steps/sessionStateSteps.ts
 import type { ModelMessage } from "ai";
-import { getStore } from "@/app/lib/store";
 
 const historyKey = (sessionId: string) => `sess:${sessionId}:history`;
-
-function historyMaxMessages(): number {
-  const n = Number(process.env.HISTORY_MAX_MESSAGES ?? "60");
-  return Number.isFinite(n) && n > 0 ? Math.max(8, Math.min(300, Math.floor(n))) : 60;
-}
 
 export async function loadHistoryStep(sessionId: string): Promise<ModelMessage[]> {
   "use step";
 
-  const store = getStore();
-  const history = (await store.get<ModelMessage[]>(historyKey(sessionId))) ?? [];
-  return Array.isArray(history) ? history : [];
+  const { Redis } = await import("@upstash/redis");
+
+  const url = process.env.KV_REST_API_URL ?? process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.KV_REST_API_TOKEN ?? process.env.UPSTASH_REDIS_REST_TOKEN;
+
+  if (!url || !token) return [];
+
+  const redis = new Redis({ url, token });
+  return (await redis.get(historyKey(sessionId))) ?? [];
 }
 
 export async function saveHistoryStep(sessionId: string, history: ModelMessage[]) {
   "use step";
 
-  const store = getStore();
-  const max = historyMaxMessages();
-  const trimmed = Array.isArray(history) ? history.slice(-max) : [];
-  await store.set(historyKey(sessionId), trimmed as any);
+  const { Redis } = await import("@upstash/redis");
+
+  const url = process.env.KV_REST_API_URL ?? process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.KV_REST_API_TOKEN ?? process.env.UPSTASH_REDIS_REST_TOKEN;
+
+  if (!url || !token) return;
+
+  const redis = new Redis({ url, token });
+  await redis.set(historyKey(sessionId), history);
 }
