@@ -1,92 +1,40 @@
-import { start } from "workflow/api";
-import { autopilotWorkflow } from "@/app/workflows/autopilot";
-import {
-  acquireAutopilotStartLock,
-  getAutopilotHeartbeat,
-  getPrimary,
-  isAutopilotEnabled,
-  setPrimary,
-  type PrimaryTarget,
-} from "@/app/lib/autopilotState";
-import { getLastSession } from "@/app/lib/sessionMeta";
+import { getStore } from "@/app/lib/store";
+import type { Channel } from "@/app/lib/identity";
 
-const AUTOPILOT_HEARTBEAT_STALE_MS = 3 * 60 * 1000;
+export type PrimaryTarget = { channel: Channel; sessionId: string };
 
-export async function ensureAutopilotPrimary(): Promise<PrimaryTarget | null> {
-  const existing = await getPrimary();
-  if (existing) return existing;
+const KEY_PRIMARY = "autopilot:primary";
+const KEY_ENABLED = "autopilot:enabled";
+const KEY_INTERVAL = "autopilot:interval_seconds";
 
-  const last = await getLastSession("any");
-  if (!last) return null;
-
-  const primary: PrimaryTarget = {
-    channel: last.channel,
-    sessionId: last.sessionId,
-  };
-  await setPrimary(primary);
-  return primary;
+export async function getPrimary(): Promise<PrimaryTarget | null> {
+  const store = getStore();
+  return (await store.get<PrimaryTarget>(KEY_PRIMARY)) ?? null;
 }
 
-export async function startAutopilotIfNeeded(reason: "cron" | "ui") {
-  const enabled = await isAutopilotEnabled();
-  if (!enabled) {
-    return {
-      enabled,
-      started: false,
-      reason: "disabled",
-    };
-  }
+export async function setPrimary(target: PrimaryTarget): Promise<void> {
+  const store = getStore();
+  await store.set(KEY_PRIMARY, target);
+}
 
-  const primary = await ensureAutopilotPrimary();
-  if (!primary) {
-    return {
-      enabled,
-      started: false,
-      reason: "no_primary",
-    };
-  }
+export async function isAutopilotEnabled(): Promise<boolean> {
+  const store = getStore();
+  return (await store.get<string>(KEY_ENABLED)) === "1";
+}
 
-  const heartbeat = await getAutopilotHeartbeat();
-  const heartbeatAgeMs = heartbeat ? Date.now() - heartbeat.ts : null;
+export async function setAutopilotEnabled(enabled: boolean): Promise<void> {
+  const store = getStore();
+  await store.set(KEY_ENABLED, enabled ? "1" : "0");
+}
 
-  if (
-    heartbeat &&
-    heartbeatAgeMs !== null &&
-    heartbeatAgeMs >= 0 &&
-    heartbeatAgeMs < AUTOPILOT_HEARTBEAT_STALE_MS &&
-    heartbeat.state !== "disabled"
-  ) {
-    return {
-      enabled,
-      started: false,
-      reason: "heartbeat_fresh",
-      heartbeatAgeMs,
-      heartbeatState: heartbeat.state,
-      primary,
-    };
-  }
+export async function getIntervalSeconds(): Promise<number> {
+  const store = getStore();
+  const v = await store.get<string>(KEY_INTERVAL);
+  const n = v ? Number(v) : NaN;
+  return Number.isFinite(n) ? n : 300; // default 5 minutes
+}
 
-  const acquiredLock = await acquireAutopilotStartLock(`cron_${Date.now()}`);
-  if (!acquiredLock) {
-    return {
-      enabled,
-      started: false,
-      reason: "start_lock_held",
-      heartbeatAgeMs,
-      heartbeatState: heartbeat?.state,
-      primary,
-    };
-  }
-
-  const run = await start(autopilotWorkflow, []);
-
-  return {
-    enabled,
-    started: true,
-    reason,
-    runId: run.runId,
-    heartbeatAgeMs,
-    heartbeatState: heartbeat?.state,
-    primary,
-  };
+export async function setIntervalSeconds(seconds: number): Promise<void> {
+  const store = getStore();
+  await store.set(KEY_INTERVAL, String(seconds));
 }
