@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "next dev",
-    "build": "next build --no-turbo",
+    "build": "next build --webpack",
     "start": "next start -H 0.0.0.0 -p ${PORT:-3000}",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
@@ -36,6 +36,6 @@
     "typescript": "latest"
   },
   "resolutions": {
-    "@workflow/world-vercel": "file:./vendor/workflow-world-vercel-5.0.0-beta.7.tgz"
+    "@workflow/world-vercel": "file:./vendor/workflow-world-vercel-5.0.0-beta.7-shim.1.tgz"
   }
 }

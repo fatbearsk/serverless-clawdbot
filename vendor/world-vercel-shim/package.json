@@ -1,6 +1,6 @@
 {
   "name": "@workflow/world-vercel",
-  "version": "5.0.0-beta.7",
+  "version": "5.0.0-beta.7-shim.1",
   "description": "Shim: redirects @workflow/world-vercel imports to @open-workflow/world-redis so the bundle resolves on non-Vercel platforms (EdgeOne / OpenNext).",
   "type": "module",
   "main": "./index.js",

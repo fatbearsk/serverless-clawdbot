@@ -11,7 +11,6 @@
 import {
   createRedisWorld,
   createWorld,
-  MemoryRedisClient,
   NodeRedisClient,
   UpstashRedisClient,
 } from "@open-workflow/world-redis";
@@ -20,6 +19,6 @@ import {
 // so any code path that names it directly still resolves.
 export const createVercelWorld = createWorld;
 
-export { createRedisWorld, createWorld, MemoryRedisClient, NodeRedisClient, UpstashRedisClient };
+export { createRedisWorld, createWorld, NodeRedisClient, UpstashRedisClient };
 
 export default createWorld;

@@ -1778,9 +1778,9 @@
     undici "7.22.0"
     zod "4.3.6"
 
-"@workflow/world-vercel@5.0.0-beta.7", "@workflow/world-vercel@file:./vendor/workflow-world-vercel-5.0.0-beta.7.tgz":
-  version "5.0.0-beta.7"
-  resolved "file:./vendor/workflow-world-vercel-5.0.0-beta.7.tgz#81f86a62a4e5987a447c7f50227e7bca8987b22e"
+"@workflow/world-vercel@5.0.0-beta.7", "@workflow/world-vercel@file:./vendor/workflow-world-vercel-5.0.0-beta.7-shim.1.tgz":
+  version "5.0.0-beta.7-shim.1"
+  resolved "file:./vendor/workflow-world-vercel-5.0.0-beta.7-shim.1.tgz#2480f692e28d1af1a3c22383a1be8aa2f120a2cc"
 
 "@workflow/world@5.0.0-beta.5":
   version "5.0.0-beta.5"
