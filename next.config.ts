@@ -49,13 +49,31 @@ process.env.WORKFLOW_BASE_URL ||=
 
 const nextConfig: NextConfig = {
   reactStrictMode: false,
-   typescript: {
+  typescript: {
     // Dangerously allow production builds to successfully complete even if
     // your project has type errors.
     ignoreBuildErrors: true,
   },
   // world-redis (and its node-redis dep) run on the server only.
   serverExternalPackages: ["@open-workflow/world-redis"],
+  // OpenNext / EdgeOne strip .well-known/ directories from the deployed
+  // function bundle, so the eager-generated flow + webhook route files at
+  // app/.well-known/workflow/v1/* are missing at runtime. Mirror routes at
+  // app/api/wf/* re-export the same handlers under a non-dot path; these
+  // rewrites translate the canonical Workflow SDK URLs to those mirrors so
+  // the dispatcher and external webhook callers don't need to change.
+  async rewrites() {
+    return [
+      {
+        source: "/.well-known/workflow/v1/flow",
+        destination: "/api/wf/flow",
+      },
+      {
+        source: "/.well-known/workflow/v1/webhook/:token",
+        destination: "/api/wf/webhook/:token",
+      },
+    ];
+  },
 };
 
 export default withWorkflow(nextConfig);
