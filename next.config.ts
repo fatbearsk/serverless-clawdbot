@@ -63,16 +63,27 @@ const nextConfig: NextConfig = {
   // rewrites translate the canonical Workflow SDK URLs to those mirrors so
   // the dispatcher and external webhook callers don't need to change.
   async rewrites() {
-    return [
-      {
-        source: "/.well-known/workflow/v1/flow",
-        destination: "/api/wf/flow",
-      },
-      {
-        source: "/.well-known/workflow/v1/webhook/:token",
-        destination: "/api/wf/webhook/:token",
-      },
-    ];
+    // beforeFiles: rewrite is applied BEFORE route matching, so even though
+    // eager mode registered .well-known/workflow/v1/flow as a real route in
+    // the manifest, requests to that path are translated to /api/wf/* before
+    // Next tries to serve the (stripped, missing) original handler.
+    // Returning a flat array would default to `afterFiles`, which only
+    // triggers on 404 — too late, since the .well-known route matches but
+    // the file is missing → 500 before fallback rewrites get a chance.
+    return {
+      beforeFiles: [
+        {
+          source: "/.well-known/workflow/v1/flow",
+          destination: "/api/wf/flow",
+        },
+        {
+          source: "/.well-known/workflow/v1/webhook/:token",
+          destination: "/api/wf/webhook/:token",
+        },
+      ],
+      afterFiles: [],
+      fallback: [],
+    };
   },
 };
 
