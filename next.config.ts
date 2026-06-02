@@ -18,6 +18,15 @@ delete process.env.VERCEL_PROJECT_ID;
 // some env var inherited from the platform pointed at something else).
 process.env.WORKFLOW_TARGET_WORLD = "@open-workflow/world-redis";
 
+// Disable @workflow/next's deferred (lazy) route discovery. Lazy mode tells
+// Next "this route exists, find it on demand" instead of emitting a real
+// route.js — that works on Vercel but on OpenNext-based platforms (EdgeOne)
+// the transformation that converts Next output to Functions doesn't preserve
+// the deferred mechanism, and the deployed bundle is missing
+// .well-known/workflow/v1/flow/route.js entirely (Cannot find module … 500).
+// Eager mode materialises the routes into source so they survive the build.
+process.env.WORKFLOW_NEXT_LAZY_DISCOVERY = "0";
+
 // Reuse the Upstash REST credentials this app already configures for other
 // purposes. Our world reads WORKFLOW_REDIS_REST_URL / WORKFLOW_REDIS_REST_TOKEN.
 if (
