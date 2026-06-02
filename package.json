@@ -5,33 +5,37 @@
   "type": "module",
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "build": "next build --no-turbo",
     "start": "next start -H 0.0.0.0 -p ${PORT:-3000}",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "workflow:web": "npx workflow web"
   },
-  "dependencies": {
-    "@ai-sdk/openai": "latest",
-    "@composio/core": "latest",
-    "xstate": "5.30.0",
-    "@composio/vercel": "latest",
-    "@upstash/redis": "latest",
-    "ai": "latest",
-    "next": "latest",
-    "react": "latest",
-    "react-dom": "latest",
+   "dependencies": {
+    "@ai-sdk/openai": "3.0.67",
+    "@composio/core": "0.10.0",
+    "@composio/vercel": "0.9.2",
+    "@open-workflow/world-redis": "file:./vendor/open-workflow-world-redis-0.1.2.tgz",
+    "@upstash/redis": "1.38.0",
+    "ai": "6.0.194",
+    "next": "16.2.7",
+"react": "19.1.0",
+"react-dom": "19.1.0",
     "ssh2": "latest",
-    "workflow": "latest",
-    "zod": "latest"
+"workflow": "5.0.0-beta.8",
+    "xstate": "5.30.0",
+    "zod": "4.3.6"
   },
   "devDependencies": {
-    "@types/node": "latest",
-    "@types/react": "latest",
-    "just-bash": "latest",
-    "@types/ssh2": "^1.15.5",
-    "eslint": "latest",
-    "eslint-config-next": "latest",
+    "@types/node": "25.9.1",
+    "@types/react": "19.2.16",
+    "@types/ssh2": "1.15.5",
+    "eslint": "10.4.1",
+    "eslint-config-next": "16.2.7",
+    "just-bash": "3.0.1",
     "typescript": "latest"
+  },
+  "resolutions": {
+    "@workflow/world-vercel": "file:./vendor/workflow-world-vercel-5.0.0-beta.7.tgz"
   }
 }
