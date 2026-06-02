@@ -8,7 +8,18 @@ import { VercelProvider } from "@composio/vercel";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const composio = new Composio({ provider: new VercelProvider() });
+// Lazily construct the Composio client on first use. Building it at module
+// top-level reads COMPOSIO_API_KEY synchronously and throws if missing, which
+// happens during Next's build-time page-data collection (the route module is
+// imported even when the env isn't injected for builds). That surfaced as a
+// silent exit 1 with "Failed to collect page data for /api/ui/composio/authorize".
+let composioInstance: any = null;
+function getComposio() {
+  if (!composioInstance) {
+    composioInstance = new Composio({ provider: new VercelProvider() });
+  }
+  return composioInstance;
+}
 
 export async function GET(req: Request) {
   const ok = await verifyUiToken(await getUiCookie());
@@ -17,6 +28,8 @@ export async function GET(req: Request) {
   if (!env("COMPOSIO_API_KEY")) {
     return new Response("Set COMPOSIO_API_KEY first.", { status: 500 });
   }
+
+  const composio = getComposio();
 
   const url = new URL(req.url);
   const toolkit = url.searchParams.get("toolkit") ?? "";
